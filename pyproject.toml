@@ -1,0 +1,10 @@
+[project]
+name = "research-to-code"
+version = "0.1.0"
+description = "Small, tested implementations of AI research ideas and engineering concepts."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest]
+pythonpath = ["."]
+testpaths = ["tests"]
