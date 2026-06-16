@@ -87,7 +87,12 @@ class MultiHeadAttn:
                     S_ij = np.where(masking, float('-inf'), S_ij)
                 
                 m_ij = np.max(S_ij, axis=-1, keepdims=True)
-                P_ij = np.exp(S_ij - m_ij)
+                m_ij_safe = np.where(m_ij == float("-inf"), 0.0, m_ij)
+                
+                P_ij = np.exp(S_ij - m_ij_safe)
+                if causal_mask:
+                    P_ij = np.where(masking, 0.0, P_ij)
+                
                 l_ij = np.sum(P_ij, axis=-1, keepdims=True)
                 
                 m_old = m[i:i+B_r]
@@ -98,12 +103,12 @@ class MultiHeadAttn:
                 alpha = np.exp(m_old - m_new) # factor correction for old tile
                 beta = np.exp(m_ij - m_new) # factor correction for new tile
                 
-                l_new = (alpha * l_old) + (beta + l_ij)
+                l_new = (alpha * l_old) + (beta * l_ij)
                 
                 O_old = O[i:i+B_r]
                 safe_l_new = np.where(l_new == 0, 1.0, l_new)
                 
-                O[i:i+B_r] = ((O_old * l_old * alpha) * (P_ij @ V_j * beta)) / safe_l_new
+                O[i:i+B_r] = ((O_old * l_old * alpha) + (P_ij @ V_j * beta)) / safe_l_new
                 
                 if verbose:
                     print(f"   -> Skor S_ij (Local):\n{S_ij}")
