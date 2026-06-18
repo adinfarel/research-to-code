@@ -49,18 +49,21 @@ def add_kernel(x_ptr,
                n_elements,
                BLOCK_SIZE: tl.constexpr,
                ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(axis=0) # (P_id, 1) 
     
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    block_start = pid * BLOCK_SIZE # (P_id, 1) * BLOCK_SIZE (1024)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE) # (P_id, 1) + (Block_size,) = (P_id, Block_size)
+    # [[P_id=0 --> 1024]
+    # [P_id=1 --> 1024], etc]
     
     mask = offsets < n_elements
     
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
+    # Output[i] = x[i] + y[i]
     output = x + y
     
-    tl.store(output_ptr + output, output, mask=mask)
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 
 def add(x: torch.Tensor, y: torch.Tensor):
