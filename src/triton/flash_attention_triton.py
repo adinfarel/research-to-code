@@ -2,10 +2,95 @@
 Build flash attention but in triton term (Low-Level GPU)
 '''
 
+from numpy import dtype
 import torch
 
 import triton
 import triton.language as tl
+
+@triton.jit
+def _attn_fwd_inner(
+    O_block,
+    m_i,
+    l_i,
+    Q_block,
+    K_block_ptr,
+    V_block_ptr,
+    block_index_q,
+    softmax_scale,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    STAGE: tl.constexpr,
+    offs_q: tl.constexpr,
+    offs_kv: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+):
+    # range of values handled by this stage
+    
+    # IF CAUSAL:
+    #
+    #     [[Diag_Block, Mask_Block, Mask_Block],
+    #      [No_Mask_Block, Diag_Block, Mask_Block],
+    #      [No_Mask_Block, No_Mask_Block, Diag_Block]]
+    
+    if STAGE == 1:
+        # from 0 to the left of diagonal
+        lo, hi = 0, block_index_q * BLOCK_SIZE_Q
+    elif STAGE == 3:
+        # used only for the block which there is transition between non-masked and masked keys
+        # diagonal block
+        lo, hi = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
+        lo = tl.multiple_of(lo, BLOCK_SIZE_Q)
+    else:
+        # only if use non-causal attn
+        lo, hi = 0, SEQ_LEN
+    
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    
+    for start_kv in range(lo, hi, BLOCK_SIZE_KV):
+        # let the compiler know that start_kv is a multiple of BLOCK_SIZE_KV
+        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
+        
+        # -- compute qk --
+        K_block = tl.load(K_block_ptr)
+        QK_block = tl.dot(Q_block, K_block)
+        
+        if STAGE == 2:
+            mask = offs_q[:, None] >= [start_kv + offs_kv[None, :]]
+            QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+            QK_block -= m_ij[:, None]
+        else:
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1) * softmax_scale)
+            QK_block = QK_block * softmax_scale - m_ij[:, None]
+
+        # compute exponential each value (element-wise) that stable by - maximum value each row query
+        P_block = tl.math.exp(QK_block)
+        
+        # compute sum by rows of the attention scores
+        l_ij = tl.sum(P_block, 1)
+        
+        # correction factor for prev l_i
+        alpha = tl.math.exp(m_i - m_ij)
+        
+        # compute l_i with correction factor
+        l_i = l_i * alpha + l_ij # in flash_attention pytorch l_ij * beta, but this time no
+        
+        V_block = tl.load(V_block_ptr)
+        P_block = P_block.to(tl.float16)
+        
+        # compute output: O_new = P x V + O_old * alpha
+        O_block = O_block * alpha[:, None]
+        O_block = tl.dot(P_block, V_block, O_block) # O_block += P_block @ V_block
+        
+        m_i = m_ij
+         
+        # move to the next block
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, K_block_ptr))
+    
+    return O_block, l_i, m_i
 
 @triton.jit
 def _attn_fwd(
@@ -88,7 +173,69 @@ def _attn_fwd(
         order=(1, 0)
     )
     
-    return
+    # offset_q: all token q based on block_id
+    offs_q = block_index_q * BLOCK_SIZE_Q * tl.arange(0, BLOCK_SIZE_Q)
+    # offset_kv: the all token k and v of this block
+    offs_kv = tl.arange(0, BLOCK_SIZE_KV)
+    # m_i: running max for each row query (max, 1)
+    m_i = tl.zeros((BLOCK_SIZE_Q), dtype=tl.float32) - float("-inf")
+    # l_i: running sum for each row query (as a denominator for normalize each value in one row query)
+    l_i = tl.zeros((BLOCK_SIZE_Q), dtype=tl.float32) + 1.0
+    # output: place for store accumulation from operations
+    O_block = tl.zeros((BLOCK_SIZE_Q, HEAD_DIM), dtype=tl.float32)
+    # O_block = (xi - m_i) / l_i
+    
+    # Stage: 3 if causal else 1
+    Q_block = tl.load(Q_block_ptr)
+    
+    if STAGE == 1 or STAGE == 3:
+        # Runs with non-causal attention
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            4 - STAGE,
+            offs_q,
+            offs_kv,
+            SEQ_LEN
+        )
+    
+    if STAGE == 3:
+        # Runs with causal attention, which is can't see info the next token cause masking
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            2,
+            offs_q,
+            offs_kv,
+            SEQ_LEN
+        )
+        
+    m_i += tl.math.log(
+        l_i
+    ) # needed to compute logsumexp for the backward pass
+    
+    # normalize block
+    O_block = O_block / l_i[:, None]
+    
+    m_ptrs = M + index_batch_head * SEQ_LEN + offs_q
+    tl.store(m_ptrs, m_i)
+    tl.store(O_block_ptr, O_block.to(O.type.element_ty))
 
 class TritonAttention(torch.autograd.function): #type: ignore
     
