@@ -2,7 +2,6 @@
 Build flash attention but in triton term (Low-Level GPU)
 '''
 
-from numpy import dtype
 import torch
 
 import triton
@@ -36,7 +35,7 @@ def _attn_fwd_inner(
     if STAGE == 1:
         # from 0 to the left of diagonal
         lo, hi = 0, block_index_q * BLOCK_SIZE_Q
-    elif STAGE == 3:
+    elif STAGE == 2:
         # used only for the block which there is transition between non-masked and masked keys
         # diagonal block
         lo, hi = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
@@ -88,7 +87,7 @@ def _attn_fwd_inner(
          
         # move to the next block
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
-        K_block_ptr = tl.advance(K_block_ptr, (0, K_block_ptr))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
     
     return O_block, l_i, m_i
 
@@ -140,7 +139,7 @@ def _attn_fwd(
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qkv_offsets, # Q[index_batch, index_head, block_index_q * BLOCK_SIZE_Q:, :]
         shape=(SEQ_LEN, HEAD_DIM),
-        strides=(stride_O_seq, stride_Q_dim),
+        strides=(stride_Q_seq, stride_Q_dim),
         offsets=(block_index_q * BLOCK_SIZE_Q, 0),
         block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
         order=(1, 0)
@@ -174,7 +173,7 @@ def _attn_fwd(
     )
     
     # offset_q: all token q based on block_id
-    offs_q = block_index_q * BLOCK_SIZE_Q * tl.arange(0, BLOCK_SIZE_Q)
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     # offset_kv: the all token k and v of this block
     offs_kv = tl.arange(0, BLOCK_SIZE_KV)
     # m_i: running max for each row query (max, 1)
