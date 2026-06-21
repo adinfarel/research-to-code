@@ -236,6 +236,110 @@ def _attn_fwd(
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, O_block.to(O.type.element_ty))
 
+@triton.jit
+def _attn_bwd_preprocess(
+    O,
+    dO,
+    D,
+    SEQ_LEN,
+    BLOCK_SIZE_Q: tl.constexpr,
+    HEAD_DIM: tl.constexpr
+):
+    block_index_q = tl.program_id(0)
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    
+    index_batch_head = tl.program_id(1)
+    offs_dim = tl.arange(0, HEAD_DIM)
+    
+    # Load a single block of BLOCK_SIZE_Q rows of O
+    O_block = tl.load( # O (B, N_h, S, H_d)
+        O
+        + index_batch_head * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM,
+        + offs_dim[None, :]
+    )
+    
+    # Load a single block of BLOCK_SIZE_Q rows of dO
+    dO_block = tl.load(
+        dO
+        + index_batch_head * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM
+        + offs_dim[None, :]
+    ).to(tl.float32)
+    
+    # compute the D block
+    D_block = tl.sum(dO_block * O_block, axis=1)
+    # Store to D block
+    D_block_ptrs = D + index_batch_head * SEQ_LEN + offs_q
+    tl.store(D_block_ptrs, D_block)
+    
+@triton.jit
+def _attn_bwd_dk_dv(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    dO,
+    dQ,
+    dK,
+    dV,
+    M,
+    D,
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    NUM_HEADS,
+    SEQ_LEN,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    index_batch_head = tl.program_id(2)
+    index_batch = index_batch_head // NUM_HEADS
+    index_head = index_batch_head % NUM_HEADS
+    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(tl.int64)
+    
+    # offset seq that allows we to select right seq given the batch and head
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
+    
+    # move pointer into right place
+    Q += offset_batch_head
+    K += offset_batch_head
+    V += offset_batch_head
+    dO += offset_batch_head
+    dQ += offset_batch_head
+    dK += offset_batch_head
+    dV += offset_batch_head
+    
+    M += offset_batch_head_seq
+    D += offset_batch_head_seq
+    
+    # load scales
+    offs_dim = tl.arange(0, HEAD_DIM)
+    
+    index_block_kv = tl.program_id(0)
+    start_kv = index_block_kv * BLOCK_KV
+    
+    offs_kv = start_kv + tl.arange(0, BLOCK_KV)
+    
+    dV_block = tl.zeros((BLOCK_KV, HEAD_DIM), dtype=tl.float32)
+    dK_block = tl.zeros((BLOCK_KV, HEAD_DIM), dtype=tl.float32)
+
+    # load K and V: stay in SRAM throughout the inner loop
+    K_block = tl.load(
+        K + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    ) # Shape: (BLOCK_KV, HEAD_DIM)
+    V_block = tl.load(
+        V + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    ) # Shape: (BLOCK_KV, HEAD_DIM)
+    
+    offs_q = tl.arange(0, BLOCK_Q) # 0, 128, 2*128, 3*128, and so on...
+    
+    qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    
 class TritonAttention(torch.autograd.function): #type: ignore
     
     @staticmethod
@@ -298,6 +402,60 @@ class TritonAttention(torch.autograd.function): #type: ignore
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
         return O
+
+    @staticmethod
+    def backward(ctx, dO):
+        Q, K, V, O, M = ctx.saved_tensors
+        
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == O.stride() == V.stride() == dO.stride()
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+        
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
+        NUM_WARPS, NUM_STAGES = 4, 3
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+        
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
+        D = torch.empty_like(M)
+        
+        # compute all the elements Di
+        _attn_bwd_preprocess[preprocess_grid](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO, #type: ignore
+            HEAD_DIM=ctx.HEAD_DIM
+        )
+        
+        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
+        stage = 3 if ctx.causal else 1
+        
+        # Fix KV and iterate thru all the Q blocks
+        _attn_bwd_dk_dv[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D,
+            stride_batch=Q.stride[0],
+            stride_head=Q.stride[1],
+            stride_seq=Q.stride[2],
+            stride_dim=Q.stride[3],
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MICRO, #type: ignore
+            BLOCK_KV=BLOCK_SIZE_MACRO, #type: ignore
+            HEAD_DIM=ctx.HEAD_DIM,
+            STAGE=stage, #type: ignore
+        )
         
 def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
     Q = (
