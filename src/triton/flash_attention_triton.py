@@ -2,6 +2,7 @@
 Build flash attention but in triton term (Low-Level GPU)
 '''
 
+from numpy import dtype
 import torch
 
 import triton
@@ -91,6 +92,20 @@ def _attn_fwd_inner(
     
     return O_block, l_i, m_i
 
+@triton.autotune(
+    [
+        triton.Config(
+            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+            num_stages=num_stages,
+            num_warps=num_warps
+        )
+        for BLOCK_SIZE_Q in [64, 128]
+        for BLOCK_SIZE_KV in [32, 64]
+        for num_stages in ([3, 4, 7])
+        for num_warps in [2, 4]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"]
+)
 @triton.jit
 def _attn_fwd(
     Q, 
@@ -340,6 +355,162 @@ def _attn_bwd_dk_dv(
     qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
     dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
     
+    # Iterate over the sequence
+    curr_q = 0
+    num_steps = SEQ_LEN // BLOCK_Q
+    for blk_idx in range(num_steps):
+        # load a block of Q
+        qT_block = tl.load(qT_ptrs)
+        
+        offs_q = curr_q + tl.arange(0, BLOCK_Q)
+        m = tl.load(M + offs_q)
+        
+        # how to get P^T? (QK^T)^T?
+        # here:
+        # (QK^T)^T = (K^T)^T(Q) =  K(Q^T) = P^T
+        # usually: P = QK^T
+        QK_T_block = softmax_scale * tl.dot(K_block, qT_block)
+        
+        P_T_block = tl.math.exp(QK_T_block - m[None, :])
+        
+        if STAGE == 3:
+            mask_block = (
+                offs_q[None, :] >= offs_kv[:, None]
+            )
+            P_T_block = tl.where(mask_block, P_T_block, 0.0)
+        
+        dO_block = tl.load(dO_ptrs)
+        # according to the formula: dV_new = dV_old + P^T x dO
+        dV_block = tl.dot(P_T_block.to(tl.float32), dO_block)
+        
+        # Delta
+        Di = tl.load(D + offs_q)
+        
+        # dP = dO x V^T, so dP^T = V x dO^T
+        dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
+        
+        # dS = P * (dP - Delta), so dS^T = P^T * (dP^T - Delta^T)
+        dS_T_block = P_T_block * (dpT_block - Di[None, :])
+        dS_T_block = dS_T_block.to(tl.float32)
+        
+        dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
+        
+        # increment pointers
+        curr_q += BLOCK_Q
+        qT_ptrs += BLOCK_Q * stride_seq
+        dO_ptrs += BLOCK_Q * stride_seq
+    
+    # write back dV
+    dV_block_ptrs = dV + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    tl.store(dV_block_ptrs, dV_block)
+    
+    # write back dK
+    dK_block_ptrs = dV + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    tl.store(dK_block_ptrs, dV_block)
+
+@triton.jit
+def _attn_bwd_dq(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    dO,
+    dQ,
+    dK,
+    dV,
+    M,
+    D,
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    NUM_HEADS,
+    SEQ_LEN,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    index_batch_head = tl.program_id(2)
+    index_batch = index_batch_head // NUM_HEADS
+    index_head = index_batch_head % NUM_HEADS
+    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(tl.int64)
+    
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
+    
+    # move pointer into right place
+    Q += offset_batch_head
+    K += offset_batch_head
+    V += offset_batch_head
+    dO += offset_batch_head
+    dQ += offset_batch_head
+    dK += offset_batch_head
+    dV += offset_batch_head
+    
+    M += offset_batch_head_seq
+    D += offset_batch_head_seq
+    
+    # load scales
+    offs_dim = tl.arange(0, HEAD_DIM)
+    
+    index_block_q = tl.program_id(0)
+    
+    start_q = index_block_q * BLOCK_Q
+    offs_q = start_q + tl.arange(0, BLOCK_Q)
+        
+    Q_block = tl.load(
+        Q
+        + offs_q[:, None] * stride_seq
+        + offs_dim[None, :] * stride_dim
+    )
+    dQ_block = tl.zeros((BLOCK_Q, HEAD_DIM), dtype=tl.float32)
+    dO_block = tl.load(
+        dO
+        + offs_q[:, None] * stride_seq
+        + offs_dim[None, :] * stride_dim
+    )
+    
+    M_block = tl.load(M + offs_q)
+    M_block = M_block[:, None]
+    
+    offs_kv = tl.arange(0, BLOCK_KV)
+    
+    # access the K and V as transpose blocks
+    kT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    vT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    
+    Di = tl.load(O + offs_q)
+    
+    curr_kv = 0
+    num_steps = SEQ_LEN // BLOCK_KV
+    for blk_idx in range(num_steps):
+        K_T_block = tl.load(kT_ptrs)
+        V_T_block = tl.load(vT_ptrs)
+        
+        QK_block = softmax_scale * tl.dot(Q_block, K_T_block)
+        P_block = tl.math.exp(QK_block - M_block)
+        
+        if STAGE == 3:
+            offs_kv = curr_kv + tl.arange(0, BLOCK_KV)
+            mask_block = offs_q[:, None] >= offs_kv[None, :]
+            P_block = tl.where(mask_block, P_block, 0.0)
+        
+        # compute dP and dS
+        dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
+        dS_block = P_block * (dP_block - Di[:, None])
+        dS_block = dS_block.to(tl.float16)
+        
+        # compute dQ
+        dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
+        
+        # increment pointer
+        curr_kv += BLOCK_KV
+        kT_ptrs += BLOCK_KV * stride_seq
+        vT_ptrs += BLOCK_KV * stride_seq
+    
+    dQ_block_ptrs = dQ * offs_q[:, None] * stride_seq + offs_dim[:, None] * stride_dim
+    tl.store(dQ_block_ptrs, dQ_block)
+    
 class TritonAttention(torch.autograd.function): #type: ignore
     
     @staticmethod
@@ -363,7 +534,7 @@ class TritonAttention(torch.autograd.function): #type: ignore
         )
 
         M = torch.empty(
-            (BATCH_SIZE, HEAD_DIM, SEQ_LEN), device=Q.device, dtype=torch.float32
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32
         )
         
         _attn_fwd[grid](
@@ -453,6 +624,30 @@ class TritonAttention(torch.autograd.function): #type: ignore
             SEQ_LEN=SEQ_LEN,
             BLOCK_Q=BLOCK_SIZE_MICRO, #type: ignore
             BLOCK_KV=BLOCK_SIZE_MACRO, #type: ignore
+            HEAD_DIM=ctx.HEAD_DIM,
+            STAGE=stage, #type: ignore
+        )
+        
+        # fix Q and iterate thru all the KV block
+        _attn_bwd_dq[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D,
+            stride_batch=Q.stride[0],
+            stride_head=Q.stride[1],
+            stride_seq=Q.stride[2],
+            stride_dim=Q.stride[3],
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MACRO, #type: ignore
+            BLOCK_KV=BLOCK_SIZE_MICRO, #type: ignore
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage, #type: ignore
         )
