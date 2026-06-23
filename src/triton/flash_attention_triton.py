@@ -11,8 +11,8 @@ import triton.language as tl
 @triton.jit
 def _attn_fwd_inner(
     O_block,
-    m_i,
     l_i,
+    m_i,
     Q_block,
     K_block_ptr,
     V_block_ptr,
@@ -58,7 +58,7 @@ def _attn_fwd_inner(
         
         if STAGE == 2:
             mask = offs_q[:, None] >= [start_kv + offs_kv[None, :]]
-            QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e6)
+            QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e30)
             m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
             QK_block -= m_ij[:, None]
         else:
@@ -270,7 +270,7 @@ def _attn_bwd_preprocess(
     O_block = tl.load( # O (B, N_h, S, H_d)
         O
         + index_batch_head * HEAD_DIM * SEQ_LEN
-        + offs_q[:, None] * HEAD_DIM,
+        + offs_q[:, None] * HEAD_DIM
         + offs_dim[None, :]
     )
     
@@ -405,8 +405,8 @@ def _attn_bwd_dk_dv(
     tl.store(dV_block_ptrs, dV_block)
     
     # write back dK
-    dK_block_ptrs = dV + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
-    tl.store(dK_block_ptrs, dV_block)
+    dK_block_ptrs = dK + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    tl.store(dK_block_ptrs, dK_block)
 
 @triton.jit
 def _attn_bwd_dq(
@@ -476,10 +476,10 @@ def _attn_bwd_dq(
     offs_kv = tl.arange(0, BLOCK_KV)
     
     # access the K and V as transpose blocks
-    kT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
-    vT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    kT_ptrs = K + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    vT_ptrs = V + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
     
-    Di = tl.load(O + offs_q)
+    Di = tl.load(D + offs_q)
     
     curr_kv = 0
     num_steps = SEQ_LEN // BLOCK_KV
@@ -508,7 +508,7 @@ def _attn_bwd_dq(
         kT_ptrs += BLOCK_KV * stride_seq
         vT_ptrs += BLOCK_KV * stride_seq
     
-    dQ_block_ptrs = dQ * offs_q[:, None] * stride_seq + offs_dim[:, None] * stride_dim
+    dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[:, None] * stride_dim
     tl.store(dQ_block_ptrs, dQ_block)
     
 class TritonAttention(torch.autograd.function): #type: ignore
@@ -651,6 +651,8 @@ class TritonAttention(torch.autograd.function): #type: ignore
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage, #type: ignore
         )
+
+        return dQ, dK, dV, None, None
         
 def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
     Q = (
@@ -706,3 +708,8 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
     assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)
     assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
+
+if __name__ == "__main__":
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
+    print("PASSED")
