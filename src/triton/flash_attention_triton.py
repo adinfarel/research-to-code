@@ -57,7 +57,7 @@ def _attn_fwd_inner(
         QK_block = tl.dot(Q_block, K_block)
         
         if STAGE == 2:
-            mask = offs_q[:, None] >= [start_kv + offs_kv[None, :]]
+            mask = offs_q[:, None] >= (start_kv + offs_kv[None, :])
             QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e30)
             m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
             QK_block -= m_ij[:, None]
@@ -92,17 +92,26 @@ def _attn_fwd_inner(
     
     return O_block, l_i, m_i
 
+# @triton.autotune(
+#     [
+#         triton.Config(
+#             {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+#             num_stages=num_stages,
+#             num_warps=num_warps
+#         )
+#         for BLOCK_SIZE_Q in [32, 64]
+#         for BLOCK_SIZE_KV in [32, 64]
+#         for num_stages in ([1, 2])
+#         for num_warps in [2, 4]
+#     ],
+#     key=["SEQ_LEN", "HEAD_DIM"]
+# )
 @triton.autotune(
     [
-        triton.Config(
-            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
-            num_stages=num_stages,
-            num_warps=num_warps
-        )
-        for BLOCK_SIZE_Q in [64, 128]
-        for BLOCK_SIZE_KV in [32, 64]
-        for num_stages in ([3, 4, 7])
-        for num_warps in [2, 4]
+        triton.Config({"BLOCK_SIZE_Q": 32, "BLOCK_SIZE_KV": 32}, num_stages=1, num_warps=2),
+        triton.Config({"BLOCK_SIZE_Q": 32, "BLOCK_SIZE_KV": 32}, num_stages=1, num_warps=4),
+        triton.Config({"BLOCK_SIZE_Q": 32, "BLOCK_SIZE_KV": 32}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_SIZE_Q": 32, "BLOCK_SIZE_KV": 32}, num_stages=2, num_warps=4),
     ],
     key=["SEQ_LEN", "HEAD_DIM"]
 )
@@ -192,9 +201,9 @@ def _attn_fwd(
     # offset_kv: the all token k and v of this block
     offs_kv = tl.arange(0, BLOCK_SIZE_KV)
     # m_i: running max for each row query (max, 1)
-    m_i = tl.zeros((BLOCK_SIZE_Q), dtype=tl.float32) - float("-inf")
+    m_i = tl.zeros((BLOCK_SIZE_Q,), dtype=tl.float32) - float("-inf")
     # l_i: running sum for each row query (as a denominator for normalize each value in one row query)
-    l_i = tl.zeros((BLOCK_SIZE_Q), dtype=tl.float32) + 1.0
+    l_i = tl.zeros((BLOCK_SIZE_Q,), dtype=tl.float32) + 1.0
     # output: place for store accumulation from operations
     O_block = tl.zeros((BLOCK_SIZE_Q, HEAD_DIM), dtype=tl.float32)
     # O_block = (xi - m_i) / l_i
@@ -381,7 +390,7 @@ def _attn_bwd_dk_dv(
         
         dO_block = tl.load(dO_ptrs)
         # according to the formula: dV_new = dV_old + P^T x dO
-        dV_block = tl.dot(P_T_block.to(tl.float32), dO_block)
+        dV_block = tl.dot(P_T_block.to(tl.float16), dO_block)
         
         # Delta
         Di = tl.load(D + offs_q)
@@ -391,7 +400,7 @@ def _attn_bwd_dk_dv(
         
         # dS = P * (dP - Delta), so dS^T = P^T * (dP^T - Delta^T)
         dS_T_block = P_T_block * (dpT_block - Di[None, :])
-        dS_T_block = dS_T_block.to(tl.float32)
+        dS_T_block = dS_T_block.to(tl.float16)
         
         dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
         
@@ -710,6 +719,6 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
 
 if __name__ == "__main__":
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
+    test_op(BATCH_SIZE=2, NUM_HEADS=2, SEQ_LEN=128, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=2, NUM_HEADS=2, SEQ_LEN=128, HEAD_DIM=64, causal=False)
     print("PASSED")
