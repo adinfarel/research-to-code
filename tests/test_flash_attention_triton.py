@@ -5,34 +5,35 @@ Testing flash attention triton whether running correctly
 import torch
 from src.triton.flash_attention_triton import TritonAttention
 
-def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
+def test_op():
     Q = (
         torch.empty(
-            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+            (2, 2, 8, 4), device="cuda"
         )
         .normal_(mean=0.0, std=0.5)
         .requires_grad_()
     )
     K = (
         torch.empty(
-            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+            (2, 2, 8, 4), device="cuda"
         )
         .normal_(mean=0.0, std=0.5)
         .requires_grad_()
     )
     V = (
         torch.empty(
-            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+            (2, 2, 8, 4), device="cuda"
         )
         .normal_(mean=0.0, std=0.5)
         .requires_grad_()
     )
 
-    softmax_scale = 1 / (HEAD_DIM**0.5)
+    softmax_scale = 1 / (4**0.5)
     dO = torch.randn_like(Q)
     
-    MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device="cuda"))
+    MASK = torch.tril(torch.ones((8, 8), device="cuda"))
     P = torch.matmul(Q, K.transpose(2,3)) * softmax_scale
+    causal = True
     if causal:
         P[:, :, MASK == 0] = float("-inf")
         # OR
@@ -47,7 +48,7 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     ref_dQ, Q.grad = Q.grad.clone(), None #type: ignore
     
     # Triton imp
-    tri_out = TritonAttention(Q, K, V, causal, softmax_scale).half()
+    tri_out = TritonAttention.apply(Q, K, V, causal, softmax_scale).half()
     tri_out.backward(dO)
     tri_dV, V.grad = V.grad.clone(), None #type: ignore
     tri_dK, K.grad = K.grad.clone(), None #type: ignore

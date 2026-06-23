@@ -511,7 +511,7 @@ def _attn_bwd_dq(
     dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[:, None] * stride_dim
     tl.store(dQ_block_ptrs, dQ_block)
     
-class TritonAttention(torch.autograd.function): #type: ignore
+class TritonAttention(torch.autograd.Function): #type: ignore
     
     @staticmethod
     def forward(ctx, Q, K, V, causal, softmax_scale):
@@ -544,22 +544,22 @@ class TritonAttention(torch.autograd.function): #type: ignore
             softmax_scale=softmax_scale,
             M=M,
             O=O,
-            stride_Q_batch=Q.stride[0],
-            stride_Q_head=Q.stride[1],
-            stride_Q_seq=Q.stride[2],
-            stride_Q_dim=Q.stride[3],
-            stride_K_batch=K.stride[0],
-            stride_K_head=K.stride[1],
-            stride_K_seq=K.stride[2],
-            stride_K_dim=K.stride[3],
-            stride_V_batch=V.stride[0],
-            stride_V_head=V.stride[1],
-            stride_V_seq=V.stride[2],
-            stride_V_dim=V.stride[3],
-            stride_O_batch=O.stride[0], #type: ignore
-            stride_O_head=O.stride[1], #type: ignore
-            stride_O_seq=O.stride[2], #type: ignore
-            stride_O_dim=O.stride[3], #type: ignore
+            stride_Q_batch=Q.stride(0),
+            stride_Q_head=Q.stride(1),
+            stride_Q_seq=Q.stride(2),
+            stride_Q_dim=Q.stride(3),
+            stride_K_batch=K.stride(0),
+            stride_K_head=K.stride(1),
+            stride_K_seq=K.stride(2),
+            stride_K_dim=K.stride(3),
+            stride_V_batch=V.stride(0),
+            stride_V_head=V.stride(1),
+            stride_V_seq=V.stride(2),
+            stride_V_dim=V.stride(3),
+            stride_O_batch=O.stride(0),
+            stride_O_head=O.stride(1),
+            stride_O_seq=O.stride(2),
+            stride_O_dim=O.stride(3),
             BATCH_SIZE=Q.shape[0],
             NUM_HEADS=Q.shape[1],
             SEQ_LEN=Q.shape[2],
@@ -616,10 +616,10 @@ class TritonAttention(torch.autograd.function): #type: ignore
             dV=dV,
             M=M,
             D=D,
-            stride_batch=Q.stride[0],
-            stride_head=Q.stride[1],
-            stride_seq=Q.stride[2],
-            stride_dim=Q.stride[3],
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_seq=Q.stride(2),
+            stride_dim=Q.stride(3),
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             BLOCK_Q=BLOCK_SIZE_MICRO, #type: ignore
@@ -696,7 +696,7 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     ref_dQ, Q.grad = Q.grad.clone(), None #type: ignore
     
     # Triton imp
-    tri_out = TritonAttention(Q, K, V, causal, softmax_scale).half()
+    tri_out = TritonAttention.apply(Q, K, V, causal, softmax_scale).half()
     tri_out.backward(dO)
     tri_dV, V.grad = V.grad.clone(), None #type: ignore
     tri_dK, K.grad = K.grad.clone(), None #type: ignore
