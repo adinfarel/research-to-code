@@ -7,6 +7,7 @@ import torch.nn as nn
 
 class RMSNorm(nn.Module):
     def __init__(self, emb_dim, eps=1e-6):
+        super().__init__()
         self.eps = eps
         # Parameter Gamma (Gain) learnable
         self.weight = nn.Parameter(torch.ones(emb_dim))
