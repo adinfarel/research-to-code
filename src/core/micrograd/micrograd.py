@@ -134,7 +134,7 @@ if __name__ == "__main__":
     e._backward()
     print(e, e.grad, d, d.grad)
 
-    r = Value(-1)
+    r = Value(-10.0)
     tanh = r.tanh()
     tanh.grad = 1.0
     tanh._backward()

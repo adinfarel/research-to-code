@@ -1,5 +1,19 @@
 '''
 Build RadixAttention simulation implementation
+
+INTUITION:
+    Many request have a same prompt such as System Prompt that use over and over
+    the motivation is, Why we not cache the prompt? We cache the prompt that often appear
+    and if we meet again similiar prompt we just use that prompt cache
+    
+    if we dealing request and request ended, we usually wipe or clear the KV-cache for the prompt
+    but RadixAttention do not that, RA keep the KV-cache of prompt user to evictable mode instead of
+    clear or wipe kv-cache if request user ended during VRAM still not full, but save KV-cache instead of clear
+    isn't it make memory save larger? yeah it's true, but RA present LRU (Least Recently Used) RA check if
+    there is node prompt that rarely use back into new request or seldom visited (less accessed) we clear that kv-cache
+    
+    for Matchy the prompt if it is the same is with RadixTree which is search that have same tokens (meaning?)
+    RadixTree use memoization algorithm but not use hashmap but activation tensor KV-cache at biner level VRAM
 '''
 
 import time

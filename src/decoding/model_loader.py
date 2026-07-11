@@ -1,5 +1,5 @@
 '''
-src/transformers/decoding/model_loader.py
+src/decoding/model_loader.py
 
 Load pretrained model + tokenizer, shared across deterministic dan
 stochastic decoding classes.

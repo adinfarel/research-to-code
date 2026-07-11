@@ -84,7 +84,7 @@ class MedusaEngine:
                 
                 for i, head in enumerate(self.medusa_heads):
                     head_logits = head(last_hidden_states)
-                    shift_steps = i * 2
+                    shift_steps = i + 1
                     logits_slice = head_logits[:, :-(shift_steps), :].contiguous()
                     labels_slice = input_ids[:, shift_steps:].contiguous()
                     
@@ -96,6 +96,7 @@ class MedusaEngine:
         
     @torch.no_grad()
     def _generate_tree_candidates(self, last_hidden_states: torch.Tensor, base_next_token: torch.Tensor):
+        '''Build medusa proposal tree.'''
         target_hidden = last_hidden_states[:, -1:, :]
         root_token = base_next_token[0, 0].item()
         
@@ -103,17 +104,24 @@ class MedusaEngine:
         for head in self.medusa_heads:
             head_logits = head(target_hidden)
             probs = F.softmax(head_logits[:, 0, :], dim=-1)
-            top_k_tokens = torch.topk(probs, self.top_k).indices.tolist()
-            branch_per_heads.append(top_k_tokens)
+            top_k_tokens = torch.topk(probs, self.top_k, dim=-1).indices.squeeze(0)
+            branch_per_heads.append(top_k_tokens.tolist())
         
-        combination_tree = list(itertools.product(*branch_per_heads))
+        all_paths = []
         
-        path_tree_tensor = []
-        for twig in combination_tree:
-            full_path = [root_token] + list(twig)
-            path_tree_tensor.append(full_path)
+        for branch in itertools.product(*branch_per_heads):
+            path = [root_token]
+            path.extend(branch)
+            
+            all_paths.append(path)
         
-        return torch.tensor(path_tree_tensor, dtype=torch.long, device=self.device)
+        tree_candidates = torch.tensor(
+            all_paths,
+            dtype=torch.long,
+            device=self.device,
+        )
+        
+        return tree_candidates
     
     @torch.no_grad()
     def _tree_attention_mask(self, tree_candidates: torch.Tensor):
@@ -122,6 +130,21 @@ class MedusaEngine:
         
         tree_mask = torch.full((total_tokens, total_tokens), float("-inf"), device=self.device)
         
+        # MAKE TREE ATTENTION LIKE THIS
+        #             Token Path 0 [0:4]   Token Path 1 [4:8]   ...
+        #         ┌────────────────────┬─────────────────────┬─────┐
+        # Path  │  0.0  -inf -inf -inf│ -inf  -inf -inf  -inf │     │
+        # 0     │  0.0   0.0  -inf -inf│ -inf  -inf -inf  -inf│    │
+        # [0:4] │  0.0   0.0   0.0 -inf│ -inf  -inf -inf  -inf│-inf│
+        #       │  0.0   0.0   0.0  0.0│ -inf  -inf -inf  -inf│    │
+        #         ├────────────────────┼─────────────────────┼─────┤
+        # Path  │ -inf  -inf -inf -inf │  0.0  -inf -inf  -inf│    │
+        # 1     │ -inf  -inf -inf -inf │  0.0   0.0  -inf -inf│    │
+        # [4:8] │ -inf  -inf -inf -inf │  0.0   0.0   0.0 -inf│-inf│
+        #       │ -inf  -inf -inf -inf │  0.0   0.0   0.0  0.0│    │
+        #         ├────────────────────┼─────────────────────┼─────┤
+        #     ... │        -inf        │         -inf        │ 0.0 │
+        #         └────────────────────┴─────────────────────┴─────┘
         for path_idx in range(n_paths):
             start_idx = path_idx * length_sequences
             end_idx = start_idx + length_sequences
@@ -133,6 +156,63 @@ class MedusaEngine:
             )
         
         return tree_mask
+
+    @torch.no_grad()
+    def _verify_single_path(
+        self,
+        input_ids: torch.Tensor,
+        path: torch.Tensor,
+    ):
+        """Naive medusa verification."""
+        
+        verify_input = torch.cat([input_ids, path.unsqueeze(0)], dim=-1)
+        
+        outputs = self.model(input_ids=verify_input)
+        logits = outputs.logits
+        
+        context_len = input_ids.shape[-1]
+        accepted = 0
+        
+        for i in range(path.shape[0]):
+            predicted = torch.argmax(logits[0, context_len + i - 1], dim=-1)
+            
+            if predicted.item() == path[i].item():
+                accepted += 1
+            else:
+                break
+        
+        return accepted
+
+    @torch.no_grad()
+    def _verify_all_paths(
+        self,
+        input_ids,
+        tree_candidates,
+    ):
+        accepted_lengths = []
+        
+        for path in tree_candidates:
+            accepted = self._verify_single_path(
+                input_ids,
+                path
+            )
+            
+            accepted_lengths.append(accepted)
+        
+        return accepted_lengths
+
+    @torch.no_grad()
+    def _select_winner(
+        self,
+        tree_candidates,
+        accepted_lengths,
+    ):
+        winner = torch.argmax(torch.tensor(accepted_lengths), dim=-1).item()
+        winner_path = tree_candidates[winner]
+        accept_len = accepted_lengths[winner]
+        accepted_prefix = winner_path[:accept_len]
+        
+        return accepted_prefix
     
     @torch.no_grad()
     def generate(self, prompt: str, max_steps: int = 15):
@@ -150,23 +230,41 @@ class MedusaEngine:
             tree_candidates = self._generate_tree_candidates(last_hidden_states, base_next_token)
             n_paths, length_sequences = tree_candidates.shape
             
-            flat_tree_tokens = tree_candidates.view(1, -1)
+            # ============================================================
+            # REAL MEDUSA
+            #
+            # Uncomment this section if using a patched transformer
+            # supporting Tree Attention.
+            #
+            # flat_tree_tokens = tree_candidates.view(1, -1)
+            # tree_mask = self._tree_attention_mask(tree_candidates)
+            # combined_input_ids = torch.cat([input_ids, flat_tree_tokens], dim=-1)
+            # outputs = self.model(
+            #     input_ids=combined_input_ids,
+            #     attention_mask=tree_mask,
+            # )
+            #
+            # ============================================================
             
-            tree_mask = self._tree_attention_mask(tree_candidates)
+            accepted_lengths = self._verify_all_paths(
+                input_ids,
+                tree_candidates,
+            )
             
-            combined_input_ids = torch.cat([input_ids, flat_tree_tokens], dim=-1)
+            accepted_prefix = self._select_winner(
+                tree_candidates,
+                accepted_lengths
+            )
             
-            path_score = []
-            for j in range(n_paths):
-                path_score.append(torch.rand(1).item())
+            if accepted_prefix.numel() == 0:
+                accepted_prefix = base_next_token.squeeze(0)
+                
+            accepted_prefix = accepted_prefix.unsqueeze(0)
             
-            winner_idx = torch.argmax(torch.tensor(path_score)).item()
-            path_winner = tree_candidates[winner_idx : winner_idx + 1, :]
-            
-            input_ids = torch.cat([input_ids, path_winner], dim=-1)
+            input_ids = torch.cat([input_ids, accepted_prefix], dim=-1)
             attn_mask = torch.ones_like(input_ids)
             
-            if (path_winner == self.tokenizer.eos_token_id).any():
+            if (accepted_prefix == self.tokenizer.eos_token_id).any():
                 break
                 
             step += 1
