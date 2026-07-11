@@ -50,7 +50,7 @@ class SpeculativeDecoding:
             curr_input_ids = torch.cat([curr_input_ids, next_token], dim=-1)
             curr_attn_mask = torch.ones_like(curr_input_ids)
             
-            if next_token == self.tokenizer.eos_token:
+            if next_token == self.tokenizer.eos_token_id:
                 break
         
         draft_tokens = torch.cat(draft_tokens, dim=-1) # Shape: [N, actual_n_tokens]
@@ -113,7 +113,7 @@ class SpeculativeDecoding:
         
         return torch.tensor([accepted_tokens], dtype=torch.long, device=self.device)
     
-    @torch.no_grad
+    @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: int = 64, do_sample: bool = False):
         input_ids, attn_mask = self._get_input_and_mask(prompt)
         prompt_len = input_ids.shape[-1]
