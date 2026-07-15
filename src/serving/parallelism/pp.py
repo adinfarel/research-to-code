@@ -2,7 +2,6 @@
 Build Pipeline Parallelism (PP) simulation implementation
 '''
 
-from numpy import gradient
 import torch
 import torch.nn as nn
 
@@ -61,9 +60,12 @@ class PP:
         forward_act = {}
         input_per_stage = {}
         
-        print(f"--- FORWARD PASS (staggered, GPipe schedule) ---")
+        print(f"--- FORWARD PASS (staggered, GPipe schedule not 1F1B) ---")
         total_fwd_steps = n_micro + n_stages - 1 # total compute all batch
         
+        # GPU = 2
+        # batch = 6, size = 2
+        # total micro batch = 3
         for t in range(total_fwd_steps):
             print(f"\n--- Timestep {t} ---")
             for stage_idx, gpu in enumerate(self.gpus):
