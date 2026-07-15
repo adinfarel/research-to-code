@@ -4,8 +4,6 @@ Build FSDP (Fully Sharded Data Parallelism) simulation implementations
 
 import copy
 
-from numpy import full
-
 class DummyGPU:
     
     def __init__(self, gpu_id: int):
@@ -76,6 +74,24 @@ class FSDP:
         for gpu in self.gpus:
             print(f"    {gpu}: {gpu.param_shard}")
     
-    def free_full_param(self, full_param: dict):
+    def free_full_params(self, full_param: dict):
         del full_param
         print(f"[FREE] Full params temprorary drops from memory GPU")
+
+if __name__ == "__main__":
+    model_params = {"W1": 10.0, "W2": 5.0, "W3": 8.0, "W4": 3.0}
+    fsdp = FSDP(model_params, num_gpus=2)
+    
+    print("\n --- FORWARD-BACKWARD ---")
+    full_params = fsdp.all_gather_params()
+    
+    grad_gpu0 = {"W1": 2.0, "W2": 1.0, "W3": 0.5, "W4": 0.3}
+    grad_gpu1 = {"W1": 4.0, "W2": 3.0, "W3": 1.5, "W4": 0.7}
+
+    fsdp.forward_backward(full_params, grad_gpu0)
+    fsdp.forward_backward(full_params, grad_gpu1)
+
+    fsdp.free_full_params(full_params)
+
+    fsdp.reduce_scatter_gradients([grad_gpu0, grad_gpu1])
+    fsdp.optimizer_step(lr=0.1)
