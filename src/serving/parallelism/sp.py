@@ -63,7 +63,7 @@ class SP:
 
         print("\n--- STAGE 4: Reduce-Scatter (Back into Shard Sequence) ---")
         
-        reduced_total = sum(col_outputs)
+        reduced_total = torch.cat(col_outputs, dim=-1)
         
         final_sp_shards = []
         scatter_chunk = seq_len // self.num_gpus
