@@ -1,5 +1,7 @@
 # Backpropagation
 
+![Figure 1](./backprop.png)
+
 as the name, Backpropagation it means go back into first layer while computing the gradient for each weight in layer
 
 ## Why We Need Backpropagation? 
@@ -41,6 +43,8 @@ dL/dx = dL/dy * dy/dx
 dL/dx = 1.0 * w
 ```
 
+![Figure 2](./scalar-backprop.png)
+
 ### Vector
 
 For derivatives it's the same, it's just that in shape vector (1 x N) or (N x 1)    
@@ -59,6 +63,8 @@ dL/dx1 = dL/dy* dy/dx1
 dL/dx1 = 1.0 * w1 # and so on with w2,w3, till wn if exists
 ```
 
+![Figure 3](./vector-backprop.png)
+
 ### Matrix
 
 Oke this one slightly different than previous such as scalar and vector, because we know to get y we multiply matrix by matrix it's call matrix multiplication (matmul), oke let's we compute   
@@ -76,12 +82,14 @@ x.T = [[x11, x21], [x12, x22]]
 # then,
 dL/dw = dL/dy * dL/dw
 dL/dw = x.T @ dL/dy
-# why, we need x for first place, see Figure ?
+# why, we need x for first place, see Figure 4
 # and for x
 dL/dx = dL/dy * dL/dx
 dL/dx = dL/dy @ w.T
 # we don't need w first place for x 
-``` 
+```
+
+![Figure 4](./matrix-backprop.png)
 
 ## Conclusion   
 So backpropagation is how we compute gradient for each weight in layer so that we can reduce loss and make model become smart, hehe thanks >.<
