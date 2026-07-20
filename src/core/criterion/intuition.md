@@ -8,8 +8,8 @@ model become good to predict distribution of target, the goals is look for error
 
 ## Types of Criterion
 
-### 1. BinaryCrossEntropy   
-Be used when model predicting binary class such as 1 or 0, spam or not spam, yes or no, etc.    
+### 1. CrossEntropy   
+Be used when model predicting categorical class such as {dog, cat, fish}, {positive, neutral, negative}, etc.  
 
 ![Figure 2](./CE.jpg)
 
@@ -31,8 +31,8 @@ Total CE = (0.35 + 2.30) / 2 = 1.32
 ```     
 > *Note: lookup to label index and get probs for index it*
 
-### 2. CrossEntropy     
-Be used when model predicting categorical class such as {dog, cat, fish}, {positive, neutral, negative}, etc.   
+### 2. BinaryCrossEntropy     
+Be used when model predicting binary class such as 1 or 0, spam or not spam, yes or no, etc.  
 
 ![Figure 3](./BCE.jpg)
 
