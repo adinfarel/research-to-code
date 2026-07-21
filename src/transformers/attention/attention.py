@@ -165,3 +165,129 @@ class MultiHeadAttention(BaseAttention):
         V = V.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         
         return Q, K, V
+
+class MultiQueryAttention(BaseAttention):
+    
+    def _init_projections(self) -> None:
+        self.query = np.random.randn(self.emb_dim, self.emb_dim)
+        self.key = np.random.randn(self.emb_dim, self.head_dim)
+        self.value = np.random.randn(self.emb_dim, self.head_dim)
+        self.proj = np.random.randn(self.emb_dim, self.emb_dim)
+    
+    def _project_qkv(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        B, T, C = X.shape
+        
+        Q, K, V = np.zeros((B, T, C)), np.zeros((B, T, self.head_dim)), np.zeros((B, T, self.head_dim))
+        for b in range(B):
+            Q[b] = _matmul_2d(X[b], self.query)
+            K[b] = _matmul_2d(X[b], self.key)
+            V[b] = _matmul_2d(X[b], self.value)
+        
+        Q = Q.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = K.reshape(B, T, 1, self.head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(B, T, 1, self.head_dim).transpose(0, 2, 1, 3)
+        
+        return Q, K, V
+    
+    def _expand_kv(self, K: np.ndarray, V: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        B, heads, T, head_dim = K.shape
+        
+        K = np.broadcast_to(K, shape=(B, self.n_heads * heads, T, head_dim))
+        V = np.broadcast_to(V, shape=(B, self.n_heads * heads, T, head_dim))
+        
+        return K, V
+
+class GroupQueryAttention(BaseAttention):
+    
+    def __init__(self, embed_dim: int, n_head: int, n_kv_head: int):
+        assert n_head % n_kv_head == 0, "n_head must be divisible with n_kv_head"
+        
+        self.n_kv_head = n_kv_head
+        self.num_queries_each_kv_head = n_head // n_kv_head
+        
+        super().__init__(embed_dim=embed_dim, n_head=n_head)
+    
+    def _init_projections(self) -> None:
+        self.query = np.random.randn(self.emb_dim, self.emb_dim)
+        self.key = np.random.randn(self.emb_dim, self.n_kv_head * self.head_dim)
+        self.value = np.random.randn(self.emb_dim, self.n_kv_head * self.head_dim)
+        self.proj = np.random.randn(self.emb_dim, self.emb_dim)
+    
+    def _project_qkv(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        B, T, C = X.shape
+        
+        Q, K, V = np.zeros((B, T, C)), \
+            np.zeros((B, T, self.n_kv_head * self.head_dim)), \
+                np.zeros((B, T, self.n_kv_head * self.head_dim))
+                
+        for b in range(B):
+            Q[b] = _matmul_2d(X[b], self.query)
+            K[b] = _matmul_2d(X[b], self.key)
+            V[b] = _matmul_2d(X[b], self.value)
+        
+        Q = Q.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        K = K.reshape(B, T, self.n_kv_head, self.head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(B, T, self.n_kv_head, self.head_dim).transpose(0, 2, 1, 3)
+
+        return Q, K, V
+
+    def _expand_kv(self, K: np.ndarray, V: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        
+        K = K.repeat(self.num_queries_each_kv_head, axis=1)
+        V = V.repeat(self.num_queries_each_kv_head, axis=1)
+        
+        return K, V
+
+class MultiLatentAttention(BaseAttention):
+    
+    def __init__(self, embed_dim: int, n_head: int, 
+                 q_latent_size: int = 1536, kv_latent_size: int = 512):
+        self.q_latent_size = q_latent_size
+        self.kv_latent_size = kv_latent_size
+        
+        super().__init__(embed_dim=embed_dim, n_head=n_head)
+        
+    def _init_projections(self) -> None:
+        self.q_down_proj = np.random.randn(self.emb_dim, self.q_latent_size)
+        self.q_up_proj = np.random.randn(self.q_latent_size, self.emb_dim)
+        
+        self.kv_down_proj = np.random.randn(self.emb_dim, self.kv_latent_size)
+        self.k_up_proj = np.random.randn(self.kv_latent_size, self.emb_dim)
+        self.v_up_proj = np.random.randn(self.kv_latent_size, self.emb_dim)
+        
+        self.proj = np.random.randn(self.emb_dim, self.emb_dim)
+    
+    def _project_qkv(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        B, T, C = X.shape
+        
+        Q_down, KV_latent = np.zeros((B, T, self.q_latent_size)), \
+            np.zeros((B, T, self.kv_latent_size))
+            
+        for b in range(B):
+            Q_down[b] = _matmul_2d(X[b], self.q_down_proj)
+            KV_latent[b] = _matmul_2d(X[b], self.kv_down_proj)
+        
+        Q = np.zeros((B, T, self.emb_dim))
+        for b in range(B):
+            Q[b] = _matmul_2d(Q_down[b], self.q_up_proj)
+        
+        Q = Q.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        KV_latent = KV_latent[:, None, :, :]
+        
+        return Q, KV_latent, KV_latent
+    
+    def _expand_kv(self, KV_latent: np.ndarray, _: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        B, _, T, latent_space = KV_latent.shape
+        KV_latent = np.squeeze(KV_latent, axis=1)
+        
+        K, V = np.zeros((B, T, self.emb_dim)), \
+            np.zeros((B, T, self.emb_dim))
+        
+        for b in range(B):
+            K[b] = _matmul_2d(KV_latent[b], self.k_up_proj)
+            V[b] = _matmul_2d(KV_latent[b], self.v_up_proj)
+        
+        K = K.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        
+        return K, V
