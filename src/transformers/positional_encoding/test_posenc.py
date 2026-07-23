@@ -1,9 +1,3 @@
-'''
-Unit tests buat positional_encoding.py.
-
-Jalankan: pytest test_positional_encoding.py -v
-'''
-
 import math
 
 import pytest
